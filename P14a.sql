@@ -1,0 +1,200 @@
+-- Create Warehouse
+CREATE OR REPLACE WAREHOUSE PROJECT14_A_WH
+WITH WAREHOUSE_SIZE='MEDIUM'
+AUTO_SUSPEND=60
+AUTO_RESUME=TRUE;
+
+USE WAREHOUSE PROJECT14_A_WH;
+
+-- Create Database
+CREATE OR REPLACE DATABASE PROJECT14_A_DB;
+
+USE DATABASE PROJECT14_A_DB;
+
+CREATE OR REPLACE SCHEMA RAW_LAYER;
+CREATE OR REPLACE SCHEMA DW_LAYER;
+
+USE SCHEMA RAW_LAYER;
+
+-- Create Stage
+CREATE OR REPLACE STAGE PROJECT14_A_STAGE; 
+
+-- Raw Data Lake Table
+CREATE OR REPLACE TABLE LAKE_RAW_EVENTS
+(
+    RAW_EVENT VARIANT
+);
+
+-- Landing Table For Raw Text
+CREATE OR REPLACE TABLE LANDING_RAW_TEXT
+(
+    RAW_RECORD_TEXT STRING
+);
+
+-- Quarantine Table
+CREATE OR REPLACE TABLE QUARANTINE_RAW_EVENTS
+(
+    QUARANTINE_ID INTEGER AUTOINCREMENT,
+    RAW_RECORD_TEXT STRING,
+    REASON STRING,
+    QUARANTINE_TS TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- LOAD RAW TEXT INTO LANDING TABLE
+COPY INTO LANDING_RAW_TEXT
+FROM @PROJECT14_A_STAGE
+FILE_FORMAT =
+(
+    TYPE=CSV
+    FIELD_DELIMITER='NONE'
+    RECORD_DELIMITER='\n'
+);
+
+SELECT COUNT(*) FROM LANDING_RAW_TEXT;
+
+-- IDENTIFY CORRUPT RECORDS
+INSERT INTO QUARANTINE_RAW_EVENTS
+(
+    RAW_RECORD_TEXT,
+    REASON
+)
+SELECT
+    RAW_RECORD_TEXT,
+    'MALFORMED_JSON_BODY'
+FROM LANDING_RAW_TEXT
+WHERE
+    TRY_PARSE_JSON(RAW_RECORD_TEXT) IS NULL
+
+    OR
+
+    TRY_PARSE_JSON(RAW_RECORD_TEXT):timestamp IS NULL
+
+    OR
+
+    TRY_PARSE_JSON(RAW_RECORD_TEXT):user_id IS NULL
+
+    OR
+
+    TRY_PARSE_JSON(RAW_RECORD_TEXT):action IS NULL;
+
+-- Load Only Good Records into Data Lake
+INSERT INTO LAKE_RAW_EVENTS
+SELECT
+    TRY_PARSE_JSON(RAW_RECORD_TEXT)
+FROM LANDING_RAW_TEXT
+WHERE
+    TRY_PARSE_JSON(RAW_RECORD_TEXT) IS NOT NULL
+
+    AND TRY_PARSE_JSON(RAW_RECORD_TEXT):timestamp IS NOT NULL
+    AND TRY_PARSE_JSON(RAW_RECORD_TEXT):user_id IS NOT NULL
+    AND TRY_PARSE_JSON(RAW_RECORD_TEXT):action IS NOT NULL;
+
+    -- 
+
+-- SCHEMA-ON-READ EXTRACTION
+SELECT
+    RAW_EVENT:event_id::STRING                    AS EVENT_ID,
+    TO_TIMESTAMP_NTZ(RAW_EVENT:timestamp::STRING) AS EVENT_TIME,
+    RAW_EVENT:user_id::NUMBER                     AS USER_ID,
+    RAW_EVENT:action::STRING                      AS ACTION,
+    RAW_EVENT:order.total::NUMBER(12,2)           AS ORDER_TOTAL,
+    RAW_EVENT:promo_code::STRING                  AS PROMO_CODE
+FROM LAKE_RAW_EVENTS
+ORDER BY EVENT_ID;
+
+-- FINANCIAL ANALYSIS
+SELECT
+    RAW_EVENT:event_id::STRING AS EVENT_ID,
+
+    RAW_EVENT:order.total::NUMBER(12,2)
+        AS ORDER_TOTAL,
+
+    RAW_EVENT:order.shipping_cost::NUMBER(12,2)
+        AS SHIPPING_COST,
+
+    RAW_EVENT:order.tax::NUMBER(12,2)
+        AS TAX,
+
+    COALESCE(
+        RAW_EVENT:discount_amount::NUMBER(12,2),
+        0
+    ) AS DISCOUNT_AMOUNT,
+
+    (
+        RAW_EVENT:order.total::NUMBER(12,2)
+        -
+        RAW_EVENT:order.shipping_cost::NUMBER(12,2)
+        -
+        RAW_EVENT:order.tax::NUMBER(12,2)
+        -
+        COALESCE(
+            RAW_EVENT:discount_amount::NUMBER(12,2),
+            0
+        )
+    ) AS NET_REVENUE
+
+FROM LAKE_RAW_EVENTS
+
+WHERE RAW_EVENT:order.total::NUMBER > 0
+
+ORDER BY EVENT_ID;
+
+-- BUSINESS KPI ANALYSIS
+
+-- Total Events
+SELECT COUNT(*) AS TOTAL_EVENTS
+FROM LAKE_RAW_EVENTS;
+
+-- Total Purchases
+SELECT
+COUNT_IF(
+    RAW_EVENT:action::STRING='purchase'
+)
+AS TOTAL_PURCHASES
+FROM LAKE_RAW_EVENTS;
+
+-- KPI Results
+SELECT
+
+    COUNT(*) AS TOTAL_EVENTS,
+
+    COUNT_IF(
+        RAW_EVENT:action::STRING='purchase'
+    ) AS TOTAL_PURCHASES,
+
+    ROUND(
+        COUNT_IF(
+            RAW_EVENT:action::STRING='purchase'
+        ) * 100.0
+        /
+        COUNT(*),
+        2
+    ) AS CONVERSION_RATE_PCT,
+
+    SUM(
+        CASE
+            WHEN RAW_EVENT:order.total IS NOT NULL
+            THEN RAW_EVENT:order.total::NUMBER(12,2)
+            ELSE 0
+        END
+    ) AS TOTAL_GROSS_REVENUE,
+
+    ROUND(
+        SUM(
+            CASE
+                WHEN RAW_EVENT:order.total::NUMBER > 0
+                THEN RAW_EVENT:order.total::NUMBER(12,2)
+                ELSE 0
+            END
+        )
+        /
+        NULLIF(
+            COUNT_IF(
+                RAW_EVENT:order.total::NUMBER > 0
+            ),
+            0
+        ),
+        2
+    ) AS AVERAGE_ORDER_VALUE
+
+FROM LAKE_RAW_EVENTS;
